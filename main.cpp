@@ -56,10 +56,12 @@ struct Combo {
 
 enum class Mode { Grid, Art };
 enum class InfoStyle { Auto, Dec, Plain };
+enum class ArtStyle { Auto, Gray, Mono };
 
 struct Opts {
     Mode mode = Mode::Grid;
     InfoStyle info = InfoStyle::Auto;
+    ArtStyle art_style = ArtStyle::Auto;
     double fps = 60.0;
     double art_width = 0.70;
     uint64_t start = 0;
@@ -617,22 +619,29 @@ static double sample(const Bitmap& b, double x, double y) {
     return a * (1 - fy) + q * fy;
 }
 
-static void draw_art(std::string& out, const Bitmap& bm, int top_row, int rows, int cols, double width_frac) {
+static void draw_art(std::string& out, const Bitmap& bm, int top_row, int rows, int cols,
+                     double width_frac, ArtStyle style) {
     if (rows <= 0 || cols <= 0 || bm.w <= 0 || bm.h <= 0) return;
+    if (style == ArtStyle::Auto) style = ArtStyle::Gray;
 
+    // Treat a terminal cell as roughly 1x2 pixels. Even in grayscale mode we
+    // sample two vertical source pixels and merge them into one shade character,
+    // which keeps CJK glyphs from looking vertically stretched.
     int max_w = std::max(1, int(std::floor(cols * width_frac)));
-    int max_h = rows * 2; // upper/lower half block gives two vertical pixels per terminal row
+    int max_h = rows * 2;
     double scale = std::min(double(max_w) / bm.w, double(max_h) / bm.h);
     int w = std::max(1, int(std::round(bm.w * scale)));
     int h = std::max(1, int(std::round(bm.h * scale)));
     int out_rows = (h + 1) / 2;
     int x0 = std::max(0, (cols - w) / 2);
     int y0 = top_row + std::max(0, (rows - out_rows) / 2);
-    constexpr double threshold = 88.0;
+
+    constexpr double mono_threshold = 88.0;
+    static constexpr const char* shades[] = {" ", "░", "▒", "▓", "█"};
 
     for (int r = 0; r < out_rows; ++r) {
         cursor(out, y0 + r, 1);
-        out += "\x1b#5";
+        out += "\x1b#5\x1b[0m";
         out.append(size_t(x0), ' ');
 
         for (int x = 0; x < w; ++x) {
@@ -641,15 +650,26 @@ static void draw_art(std::string& out, const Bitmap& bm, int top_row, int rows, 
             int py1 = py0 + 1;
             auto sy0 = (py0 + 0.5) * bm.h / h - 0.5;
             auto sy1 = (py1 + 0.5) * bm.h / h - 0.5;
-            bool up = py0 < h && sample(bm, sx, sy0) >= threshold;
-            bool dn = py1 < h && sample(bm, sx, sy1) >= threshold;
+            double up = py0 < h ? sample(bm, sx, sy0) : 0.0;
+            double dn = py1 < h ? sample(bm, sx, sy1) : 0.0;
 
-            if (up && dn) out += "█";
-            else if (up) out += "▀";
-            else if (dn) out += "▄";
+            if (style == ArtStyle::Gray) {
+                // RMS keeps thin antialiased strokes visible better than a plain
+                // average while still giving us smooth ░▒▓ edges.
+                double v = std::sqrt((up * up + dn * dn) * 0.5);
+                int level = int(std::lround(v * 4.0 / 255.0));
+                out += shades[std::clamp(level, 0, 4)];
+                continue;
+            }
+
+            bool u = up >= mono_threshold;
+            bool d = dn >= mono_threshold;
+            if (u && d) out += "█";
+            else if (u) out += "▀";
+            else if (d) out += "▄";
             else out += ' ';
         }
-        out += "\x1b[K";
+        out += "\x1b[0m\x1b[K";
     }
 }
 
@@ -678,6 +698,8 @@ static void help(const char* exe) {
         << "  --fps N                 target refresh rate, 0 = unlimited (default 60)\n"
         << "  --start N               resume from global combination index\n"
         << "  --art-width N           target art width as fraction of terminal (default 0.70)\n"
+        << "  --art-style auto|gray|mono\n"
+        << "                           gray = anti-aliased ░▒▓█; mono = █▀▄ threshold mode\n"
         << "  --font PATH             override automatic CJK font discovery\n"
         << "  --info-style auto|dec|plain\n"
         << "                           DEC double-width/double-height info when possible\n"
@@ -712,6 +734,12 @@ static Opts parse_opts(int argc, char** argv) {
         } else if (a == "--art-width") {
             if (!parse_double(next(), o.art_width) || o.art_width < 0.10 || o.art_width > 0.95)
                 throw std::runtime_error("--art-width must be 0.10..0.95");
+        } else if (a == "--art-style") {
+            std::string v = next();
+            if (v == "auto") o.art_style = ArtStyle::Auto;
+            else if (v == "gray" || v == "shade") o.art_style = ArtStyle::Gray;
+            else if (v == "mono") o.art_style = ArtStyle::Mono;
+            else throw std::runtime_error("--art-style must be auto, gray or mono");
         } else if (a == "--font") {
             o.font = next();
         } else if (a == "--info-style") {
@@ -853,7 +881,7 @@ int main(int argc, char** argv) {
                     int target_h = std::max(2, art_rows * 2);
                     int px_size = std::clamp(std::max(target_w / std::max(1, c.n), target_h) * 2, 64, 512);
                     auto bm = raster_text(*font, c, px_size);
-                    draw_art(out, bm, 1, art_rows, ts.cols, o.art_width);
+                    draw_art(out, bm, 1, art_rows, ts.cols, o.art_width, o.art_style);
 
                     int info_row = art_rows + 1;
                     if (dec) {
