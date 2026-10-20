@@ -1,0 +1,369 @@
+name: Build and Release
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FREETYPE_TAG: VER-2-15-0
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-24.04
+            os: linux
+            arch: x64
+            asset: linux-x64
+
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+            asset: linux-arm64
+
+          - name: macOS x64
+            runner: macos-15-intel
+            os: macos
+            arch: x64
+            asset: macos-x64
+
+          - name: macOS ARM64
+            runner: macos-15
+            os: macos
+            arch: arm64
+            asset: macos-arm64
+
+          - name: Windows x64
+            runner: windows-2025
+            os: windows
+            arch: x64
+            cmake_arch: x64
+            asset: windows-x64
+
+          - name: Windows ARM64
+            runner: windows-11-arm
+            os: windows
+            arch: arm64
+            cmake_arch: ARM64
+            asset: windows-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # ------------------------------------------------------------
+      # FreeType
+      # ------------------------------------------------------------
+
+      - name: Clone FreeType
+        shell: bash
+        run: |
+          git clone \
+            --depth 1 \
+            --branch "$FREETYPE_TAG" \
+            https://github.com/freetype/freetype.git \
+            freetype-src
+
+      # Linux / macOS
+      - name: Build FreeType
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          cmake \
+            -S freetype-src \
+            -B freetype-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.deps/freetype" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DFT_DISABLE_ZLIB=TRUE \
+            -DFT_DISABLE_BZIP2=TRUE \
+            -DFT_DISABLE_PNG=TRUE \
+            -DFT_DISABLE_HARFBUZZ=TRUE \
+            -DFT_DISABLE_BROTLI=TRUE \
+            -DFT_DISABLE_HVF=TRUE
+
+          cmake \
+            --build freetype-build \
+            --config Release \
+            --parallel
+
+          cmake \
+            --install freetype-build \
+            --config Release
+
+      # Windows
+      - name: Build FreeType
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $prefix = "$env:GITHUB_WORKSPACE\.deps\freetype"
+
+          cmake `
+            -S freetype-src `
+            -B freetype-build `
+            -A "${{ matrix.cmake_arch }}" `
+            -DCMAKE_INSTALL_PREFIX="$prefix" `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DFT_DISABLE_ZLIB=TRUE `
+            -DFT_DISABLE_BZIP2=TRUE `
+            -DFT_DISABLE_PNG=TRUE `
+            -DFT_DISABLE_HARFBUZZ=TRUE `
+            -DFT_DISABLE_BROTLI=TRUE `
+            -DFT_DISABLE_HVF=TRUE
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          cmake `
+            --build freetype-build `
+            --config Release `
+            --parallel
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          cmake `
+            --install freetype-build `
+            --config Release
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      # ------------------------------------------------------------
+      # Build main.cpp
+      # ------------------------------------------------------------
+
+      - name: Build application
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          mkdir -p out
+
+          CXX=c++
+
+          "$CXX" \
+            -O3 \
+            -std=c++17 \
+            -Wall \
+            -Wextra \
+            -Wpedantic \
+            -I"$GITHUB_WORKSPACE/.deps/freetype/include/freetype2" \
+            main.cpp \
+            "$GITHUB_WORKSPACE/.deps/freetype/lib/libfreetype.a" \
+            -o out/main
+
+          strip out/main || true
+
+          file out/main
+
+      - name: Generate Windows CMake project
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ci-app | Out-Null
+
+          $main = (Resolve-Path main.cpp).Path.Replace('\', '/')
+          $include = (
+            "$env:GITHUB_WORKSPACE\.deps\freetype\include\freetype2"
+          ).Replace('\', '/')
+
+          $lib = (
+            "$env:GITHUB_WORKSPACE\.deps\freetype\lib\freetype.lib"
+          ).Replace('\', '/')
+
+          @"
+          cmake_minimum_required(VERSION 3.20)
+
+          project(utf8_enum LANGUAGES CXX)
+
+          add_executable(main "$main")
+
+          target_compile_features(
+              main PRIVATE cxx_std_17
+          )
+
+          target_compile_options(
+              main PRIVATE
+              /O2
+              /W4
+          )
+
+          target_include_directories(
+              main PRIVATE
+              "$include"
+          )
+
+          target_link_libraries(
+              main PRIVATE
+              "$lib"
+          )
+          "@ | Set-Content `
+              -Path ci-app/CMakeLists.txt `
+              -Encoding UTF8
+
+      - name: Build application
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          cmake `
+            -S ci-app `
+            -B app-build `
+            -A "${{ matrix.cmake_arch }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          cmake `
+            --build app-build `
+            --config Release `
+            --parallel
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Force out |
+            Out-Null
+
+          Copy-Item `
+            app-build/Release/main.exe `
+            out/main.exe
+
+      # ------------------------------------------------------------
+      # Package
+      # ------------------------------------------------------------
+
+      - name: Package Linux
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          mkdir package
+
+          cp out/main package/main
+          chmod +x package/main
+
+          tar \
+            -czf "main-${{ matrix.asset }}.tar.gz" \
+            -C package \
+            main
+
+      - name: Package macOS
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          mkdir package
+
+          cp out/main package/main
+          chmod +x package/main
+
+          tar \
+            -czf "main-${{ matrix.asset }}.tar.gz" \
+            -C package \
+            main
+
+      - name: Package Windows
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path out/main.exe `
+            -DestinationPath "main-${{ matrix.asset }}.zip"
+
+      # ------------------------------------------------------------
+      # Upload to release job
+      # ------------------------------------------------------------
+
+      - name: Upload Unix artifact
+        if: matrix.os != 'windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.asset }}
+          path: main-${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload Windows artifact
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.asset }}
+          path: main-${{ matrix.asset }}.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  # ================================================================
+  # GitHub Release
+  # ================================================================
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Show release files
+        shell: bash
+        run: |
+          ls -lah release-assets
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd release-assets
+
+          sha256sum \
+            main-linux-x64.tar.gz \
+            main-linux-arm64.tar.gz \
+            main-macos-x64.tar.gz \
+            main-macos-arm64.tar.gz \
+            main-windows-x64.zip \
+            main-windows-arm64.zip \
+            > SHA256SUMS
+
+          cat SHA256SUMS
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          tag="build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+
+          cat > release-notes.md <<EOF
+          Automated build from commit \`${GITHUB_SHA}\`.
+          EOF
+
+          gh release create "$tag" \
+            release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Build #${GITHUB_RUN_NUMBER} (${short_sha})" \
+            --notes-file release-notes.md \
+            --prerelease
